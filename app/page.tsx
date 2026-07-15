@@ -184,17 +184,22 @@ export default function Home() {
       )}
 
       {sprite && !loading && (
-        <div className="flex flex-wrap gap-2 justify-center max-w-sm">
-          {Object.entries(sprite.palette).map(([index, color]) => (
-            <div key={index} className="flex items-center gap-1 text-xs text-zinc-400">
-              <span
-                className="inline-block w-4 h-4 rounded border border-zinc-600"
-                style={{ backgroundColor: color }}
-              />
-              {index}
-            </div>
-          ))}
-        </div>
+        <>
+          <div className="flex flex-wrap gap-2 justify-center max-w-sm">
+            {Object.entries(sprite.palette).map(([index, color]) => (
+              <div key={index} className="flex items-center gap-1 text-xs text-zinc-400">
+                <span
+                  className="inline-block w-4 h-4 rounded border border-zinc-600"
+                  style={{ backgroundColor: color }}
+                />
+                {index}
+              </div>
+            ))}
+          </div>
+          <p className="text-xs text-zinc-500">
+            {sprite.usage.inputTokens} in + {sprite.usage.outputTokens} out = {sprite.usage.totalTokens} tokens · {sprite.usage.costUSD}
+          </p>
+        </>
       )}
     </div>
   );
