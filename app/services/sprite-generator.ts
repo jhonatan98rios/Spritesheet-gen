@@ -234,10 +234,6 @@ export async function generateSprite(description: string): Promise<SpriteResult>
       new HumanMessage(userContent),
     ];
 
-    const response = await model.invoke(messages);
-    const rawOutput = extractText(response.content);
-    const usageMeta = response.usage_metadata;
-
     const attemptMessages = [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userContent },
@@ -245,17 +241,22 @@ export async function generateSprite(description: string): Promise<SpriteResult>
 
     let attemptError: string | null = null;
     let attemptUsage: Attempt["usage"] = null;
-
-    if (usageMeta) {
-      attemptUsage = {
-        inputTokens: usageMeta.input_tokens,
-        outputTokens: usageMeta.output_tokens,
-        totalTokens: usageMeta.total_tokens,
-        costUSD: computeCost(usageMeta),
-      };
-    }
+    let rawOutput = "";
 
     try {
+      const response = await model.invoke(messages);
+      rawOutput = extractText(response.content);
+      const usageMeta = response.usage_metadata;
+
+      if (usageMeta) {
+        attemptUsage = {
+          inputTokens: usageMeta.input_tokens,
+          outputTokens: usageMeta.output_tokens,
+          totalTokens: usageMeta.total_tokens,
+          costUSD: computeCost(usageMeta),
+        };
+      }
+
       const parsed = parseJson(rawOutput);
       sprite = validateAndExtract(parsed);
       // Success — record attempt and break
