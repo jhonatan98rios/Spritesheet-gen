@@ -74,6 +74,49 @@ function sanitizeCsv(csv: string): string {
     .join("\n");
 }
 
+function repairJsonWithLiteralNewlines(json: string): string {
+  // The model may embed the CSV with literal newlines inside the JSON string.
+  // We extract the csv value, escape its newlines, and reconstruct.
+  const csvKey = '"csv"';
+  const paletteKey = '"palette"';
+
+  const csvStart = json.indexOf(csvKey);
+  const paletteStart = json.indexOf(paletteKey);
+  if (csvStart === -1 || paletteStart === -1) return json;
+
+  // Find the actual string value start after "csv":
+  const colonIdx = json.indexOf(":", csvStart);
+  if (colonIdx === -1 || colonIdx > paletteStart) return json;
+
+  // Find opening quote of the value
+  const valueOpen = json.indexOf('"', colonIdx + 1);
+  if (valueOpen === -1 || valueOpen > paletteStart) return json;
+
+  // Extract everything from after the opening quote to before "palette"
+  // The CSV value is between valueOpen+1 and the last " before paletteKey
+  const rawMiddle = json.slice(valueOpen + 1, paletteStart);
+  // Walk backwards from end to find the closing quote of the csv value
+  let closeIdx = rawMiddle.length - 1;
+  while (closeIdx >= 0 && rawMiddle[closeIdx] !== '"') closeIdx--;
+  if (closeIdx < 0) return json;
+
+  // Handle trailing comma: the closing " may be followed by , or }
+  // We just want the unescaped csv content
+  let csvContent = rawMiddle.slice(0, closeIdx);
+
+  // Escape literal newlines (and other control chars in the CSV string content)
+  csvContent = csvContent
+    .replace(/\\/g, "\\\\")
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
+
+  // Reconstruct: everything before valueOpen + escaped csv + everything after closeIdx
+  const before = json.slice(0, valueOpen + 1);
+  const after = rawMiddle.slice(closeIdx); // includes the closing quote and trailing comma/WS
+  return before + csvContent + after + json.slice(paletteStart);
+}
+
 function parseResponse(text: string): { csv: string; palette: Record<string, string> } {
   // Strip markdown code fences if the model ignores instructions
   let json = text.trim();
@@ -81,25 +124,35 @@ function parseResponse(text: string): { csv: string; palette: Record<string, str
     json = json.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
   }
 
-  const parsed = JSON.parse(json);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    // Try repairing literal newlines in the csv string value
+    const repaired = repairJsonWithLiteralNewlines(json);
+    parsed = JSON.parse(repaired);
+  }
+
+  const obj = parsed as Record<string, unknown>;
 
   // Validate and sanitize csv
-  if (typeof parsed.csv !== "string") {
+  if (typeof obj.csv !== "string") {
     throw new Error("Response missing 'csv' field");
   }
-  const csv = sanitizeCsv(parsed.csv);
+  const csv = sanitizeCsv(obj.csv);
 
   // Validate palette
-  if (typeof parsed.palette !== "object" || parsed.palette === null) {
+  if (typeof obj.palette !== "object" || obj.palette === null) {
     throw new Error("Response missing 'palette' field");
   }
+  const paletteObj = obj.palette as Record<string, unknown>;
   const palette: Record<string, string> = {};
   for (let i = 0; i <= 9; i++) {
     const key = String(i);
-    if (typeof parsed.palette[key] !== "string") {
+    if (typeof paletteObj[key] !== "string") {
       throw new Error(`Palette missing key "${key}"`);
     }
-    palette[key] = parsed.palette[key];
+    palette[key] = paletteObj[key];
   }
 
   return { csv, palette };
