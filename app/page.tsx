@@ -1,9 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { SpriteResult } from "./services/sprite-generator";
+import type { SpriteResult, Attempt } from "./services/sprite-generator";
 
 const PLACEHOLDER_CSV = `\
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
@@ -101,33 +104,74 @@ function drawSprite(
   }
 }
 
+function AttemptCard({ attempt, index }: { attempt: Attempt; index: number }) {
+  const [expanded, setExpanded] = useState(false);
+  const ok = attempt.error === null;
+  const cost = attempt.usage
+    ? `${attempt.usage.totalTokens} tokens · ${attempt.usage.costUSD}`
+    : "";
+
+  return (
+    <div className={`border rounded p-3 text-xs ${ok ? "border-emerald-700 bg-emerald-950/30" : "border-red-800 bg-red-950/20"}`}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-2 w-full text-left"
+      >
+        <span className={ok ? "text-emerald-400" : "text-red-400"}>
+          {ok ? "✓" : "✗"} Attempt {index + 1}
+        </span>
+        <span className="text-zinc-500">{cost}</span>
+        {!ok && <span className="text-red-400 truncate flex-1">{attempt.error}</span>}
+        <span className="text-zinc-600 ml-auto">{expanded ? "▲" : "▼"}</span>
+      </button>
+
+      {expanded && (
+        <div className="mt-2 space-y-2">
+          {attempt.messages.map((msg, i) => (
+            <details key={i} className="text-zinc-400">
+              <summary className="cursor-pointer text-zinc-500">
+                {msg.role === "system" ? "System prompt" : "User prompt"}
+              </summary>
+              <pre className="mt-1 whitespace-pre-wrap break-all text-zinc-500 max-h-40 overflow-y-auto">
+                {msg.content}
+              </pre>
+            </details>
+          ))}
+          <details>
+            <summary className="cursor-pointer text-zinc-500">Raw output</summary>
+            <pre className="mt-1 whitespace-pre-wrap break-all text-zinc-500 max-h-40 overflow-y-auto">
+              {attempt.rawOutput}
+            </pre>
+          </details>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [description, setDescription] = useState("");
-  const [sprite, setSprite] = useState<SpriteResult | null>(null);
+  const [result, setResult] = useState<SpriteResult | null>(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
-  // Draw whenever sprite changes
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
     ctx.clearRect(0, 0, 256, 256);
-
-    if (sprite) {
-      drawSprite(ctx, sprite.csv, sprite.palette);
+    if (result?.sprite) {
+      drawSprite(ctx, result.sprite.csv, result.sprite.palette);
     } else {
       drawSprite(ctx, PLACEHOLDER_CSV, PLACEHOLDER_PALETTE);
     }
-  }, [sprite]);
+  }, [result]);
 
   const generate = useCallback(async () => {
     if (!description.trim()) return;
     setLoading(true);
-    setError(null);
+    setResult(null);
     try {
       const res = await fetch("/api/generate", {
         method: "POST",
@@ -136,9 +180,15 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Generation failed");
-      setSprite(data);
+      setResult(data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
+      // ponytail: one catch for fetch errors + server-rejected errors
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setResult({
+        sprite: null,
+        attempts: [],
+        finalError: message,
+      });
     } finally {
       setLoading(false);
     }
@@ -151,8 +201,13 @@ export default function Home() {
     [generate, loading]
   );
 
+  const totalCost = result?.attempts.reduce(
+    (sum, a) => sum + ((a.usage?.costUSD ? parseFloat(a.usage.costUSD) : 0) || 0),
+    0
+  );
+
   return (
-    <div className="min-h-screen bg-zinc-900 flex flex-col items-center justify-center gap-6 px-4">
+    <div className="min-h-screen bg-zinc-900 flex flex-col items-center justify-center gap-6 px-4 py-8">
       <canvas
         ref={canvasRef}
         width={256}
@@ -179,27 +234,41 @@ export default function Home() {
         </button>
       </div>
 
-      {error && (
-        <p className="text-red-400 text-sm max-w-sm text-center">{error}</p>
+      {result?.sprite && !loading && (
+        <div className="flex flex-wrap gap-2 justify-center max-w-sm">
+          {Object.entries(result.sprite.palette).map(([index, color]) => (
+            <div key={index} className="flex items-center gap-1 text-xs text-zinc-400">
+              <span
+                className="inline-block w-4 h-4 rounded border border-zinc-600"
+                style={{ backgroundColor: color }}
+              />
+              {index}
+            </div>
+          ))}
+        </div>
       )}
 
-      {sprite && !loading && (
-        <>
-          <div className="flex flex-wrap gap-2 justify-center max-w-sm">
-            {Object.entries(sprite.palette).map(([index, color]) => (
-              <div key={index} className="flex items-center gap-1 text-xs text-zinc-400">
-                <span
-                  className="inline-block w-4 h-4 rounded border border-zinc-600"
-                  style={{ backgroundColor: color }}
-                />
-                {index}
-              </div>
-            ))}
+      {result?.finalError && !loading && (
+        <p className="text-red-400 text-sm max-w-sm text-center">
+          All {result.attempts.length} attempts failed: {result.finalError}
+        </p>
+      )}
+
+      {result && !loading && result.attempts.length > 0 && (
+        <div className="w-full max-w-2xl space-y-2">
+          <div className="flex items-center justify-between text-xs text-zinc-500">
+            <span>
+              {result.attempts.length} attempt{result.attempts.length > 1 ? "s" : ""}
+              {result.sprite ? " (succeeded)" : " (all failed)"}
+            </span>
+            {totalCost !== undefined && totalCost > 0 && (
+              <span>Total: ${totalCost.toFixed(4)}</span>
+            )}
           </div>
-          <p className="text-xs text-zinc-500">
-            {sprite.usage.inputTokens} in + {sprite.usage.outputTokens} out = {sprite.usage.totalTokens} tokens · {sprite.usage.costUSD}
-          </p>
-        </>
+          {result.attempts.map((attempt, i) => (
+            <AttemptCard key={i} attempt={attempt} index={i} />
+          ))}
+        </div>
       )}
     </div>
   );

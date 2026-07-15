@@ -1,26 +1,35 @@
 import { ChatOpenAI } from "@langchain/openai";
 import type { UsageMetadata } from "@langchain/core/messages";
+import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 
-export interface SpriteResult {
+export interface SpriteData {
   csv: string;
   palette: Record<string, string>;
-  usage: {
-    inputTokens: number;
-    outputTokens: number;
-    totalTokens: number;
-    costUSD: string;
-  };
 }
 
-// DeepSeek V4 Flash pricing per 1M tokens (as of 2025-07)
+export interface Attempt {
+  messages: { role: string; content: string }[];
+  rawOutput: string;
+  error: string | null;
+  usage: { inputTokens: number; outputTokens: number; totalTokens: number; costUSD: string } | null;
+}
+
+export interface SpriteResult {
+  sprite: SpriteData | null;
+  attempts: Attempt[];
+  finalError: string | null;
+}
+
+// DeepSeek V4 Flash pricing per 1M tokens
 const INPUT_PRICE_PER_1M = 0.14;
 const OUTPUT_PRICE_PER_1M = 0.28;
+const MAX_RETRIES = 3;
 
 const SYSTEM_PROMPT = `You are a pixel art generator. You output ONLY valid JSON — no markdown, no explanation, no code fences. Your entire response must parse as JSON.
 
 The JSON object has exactly two keys:
 
-1. "csv" — a string containing EXACTLY 64 rows, each row containing EXACTLY 64 comma-separated integers from 0 to 9. Rows are joined by newline characters (\\n). No trailing newline. No spaces. NO MORE THAN 64 ROWS. NO LESS THAN 64 ROWS. Count them: 64 rows, 64 values per row.
+1. "csv" — a string containing EXACTLY 64 rows, each row containing EXACTLY 64 comma-separated integers from 0 to 9. Rows are joined by the escape sequence \\n (backslash-n, not a literal newline). No trailing newline. No spaces between commas and numbers.
    - 0 means transparent/background/empty space. Use it generously for empty areas around the subject.
    - Values 1-9 represent different colors (defined in the palette).
    - The sprite must be a recognizable representation of the user's description, centered in the 64x64 grid.
@@ -33,21 +42,36 @@ The JSON object has exactly two keys:
    - Use distinct, vibrant colors so each index is clearly visible.
    - Every key "0" through "9" MUST be present exactly once.
 
-CRITICAL CONSTRAINTS — VIOLATING ANY OF THESE IS AN ERROR:
-- The CSV must have EXACTLY 64 rows. Count them before outputting.
-- Each row must have EXACTLY 64 comma-separated values. No more, no less.
-- Use ONLY the digits 0-9 in the CSV. No other characters between commas.
+CRITICAL — the "csv" value is a SINGLE-LINE JSON string. Use \\n escape sequences for row separators. The value must NOT contain literal newline characters. Example: "0,0,0,1,1,0\\\\n0,0,1,1,1,1,0\\\\n..."
+
+CRITICAL CONSTRAINTS:
+- The CSV must have EXACTLY 64 rows. Count them.
+- Each row must have EXACTLY 64 comma-separated values.
+- Use ONLY the digits 0-9 in the CSV.
 - All 10 palette keys ("0" through "9") MUST be present.
-- Output ONLY the JSON object. No markdown wrapping, no explanation text.`;
+- Output ONLY the JSON object. No markdown, no text.`;
 
 function buildUserPrompt(description: string): string {
   return `Generate a 64x64 pixel art sprite of: ${description}`;
 }
 
+function buildRetryPrompt(description: string, error: string, previousOutput: string): string {
+  return `Your previous response for "${description}" was invalid. The error was: ${error}
+
+Your previous response was:
+\`\`\`
+${previousOutput.slice(0, 2000)}
+\`\`\`
+
+Please fix all issues and return ONLY valid JSON with "csv" and "palette" fields. Remember:
+- "csv" must be a SINGLE-LINE JSON string using \\\\n for row separators (NOT literal newlines)
+- EXACTLY 64 rows × 64 columns
+- ALL palette keys "0" through "9" must be present`;
+}
+
 function sanitizeCsv(csv: string): string {
   const rows = csv.trim().split("\n");
 
-  // Trim or pad to exactly 64 rows
   let normalized: string[];
   if (rows.length > 64) {
     normalized = rows.slice(0, 64);
@@ -61,7 +85,6 @@ function sanitizeCsv(csv: string): string {
     normalized = rows;
   }
 
-  // Ensure each row has exactly 64 columns
   return normalized
     .map((row) => {
       const cols = row.split(",");
@@ -75,8 +98,6 @@ function sanitizeCsv(csv: string): string {
 }
 
 function repairJsonWithLiteralNewlines(json: string): string {
-  // The model may embed the CSV with literal newlines inside the JSON string.
-  // We extract the csv value, escape its newlines, and reconstruct.
   const csvKey = '"csv"';
   const paletteKey = '"palette"';
 
@@ -84,68 +105,54 @@ function repairJsonWithLiteralNewlines(json: string): string {
   const paletteStart = json.indexOf(paletteKey);
   if (csvStart === -1 || paletteStart === -1) return json;
 
-  // Find the actual string value start after "csv":
   const colonIdx = json.indexOf(":", csvStart);
   if (colonIdx === -1 || colonIdx > paletteStart) return json;
 
-  // Find opening quote of the value
   const valueOpen = json.indexOf('"', colonIdx + 1);
   if (valueOpen === -1 || valueOpen > paletteStart) return json;
 
-  // Extract everything from after the opening quote to before "palette"
-  // The CSV value is between valueOpen+1 and the last " before paletteKey
   const rawMiddle = json.slice(valueOpen + 1, paletteStart);
-  // Walk backwards from end to find the closing quote of the csv value
   let closeIdx = rawMiddle.length - 1;
   while (closeIdx >= 0 && rawMiddle[closeIdx] !== '"') closeIdx--;
   if (closeIdx < 0) return json;
 
-  // Handle trailing comma: the closing " may be followed by , or }
-  // We just want the unescaped csv content
   let csvContent = rawMiddle.slice(0, closeIdx);
 
-  // Escape literal newlines (and other control chars in the CSV string content)
   csvContent = csvContent
     .replace(/\\/g, "\\\\")
     .replace(/\n/g, "\\n")
     .replace(/\r/g, "\\r")
     .replace(/\t/g, "\\t");
 
-  // Reconstruct: everything before valueOpen + escaped csv + everything after closeIdx
   const before = json.slice(0, valueOpen + 1);
-  const after = rawMiddle.slice(closeIdx); // includes the closing quote and trailing comma/WS
+  const after = rawMiddle.slice(closeIdx);
   return before + csvContent + after + json.slice(paletteStart);
 }
 
-function parseResponse(text: string): { csv: string; palette: Record<string, string> } {
-  // Strip markdown code fences if the model ignores instructions
+function parseJson(text: string): Record<string, unknown> {
   let json = text.trim();
   if (json.startsWith("```")) {
     json = json.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
   }
 
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(json);
+    return JSON.parse(json) as Record<string, unknown>;
   } catch {
-    // Try repairing literal newlines in the csv string value
     const repaired = repairJsonWithLiteralNewlines(json);
-    parsed = JSON.parse(repaired);
+    return JSON.parse(repaired) as Record<string, unknown>;
   }
+}
 
-  const obj = parsed as Record<string, unknown>;
-
-  // Validate and sanitize csv
-  if (typeof obj.csv !== "string") {
+function validateAndExtract(parsed: Record<string, unknown>): SpriteData {
+  if (typeof parsed.csv !== "string") {
     throw new Error("Response missing 'csv' field");
   }
-  const csv = sanitizeCsv(obj.csv);
+  const csv = sanitizeCsv(parsed.csv);
 
-  // Validate palette
-  if (typeof obj.palette !== "object" || obj.palette === null) {
+  if (typeof parsed.palette !== "object" || parsed.palette === null) {
     throw new Error("Response missing 'palette' field");
   }
-  const paletteObj = obj.palette as Record<string, unknown>;
+  const paletteObj = parsed.palette as Record<string, unknown>;
   const palette: Record<string, string> = {};
   for (let i = 0; i <= 9; i++) {
     const key = String(i);
@@ -165,9 +172,16 @@ function computeCost(usage: UsageMetadata): string {
   return total < 0.0001 ? "<$0.0001" : `$${total.toFixed(4)}`;
 }
 
-export async function generateSprite(
-  description: string
-): Promise<SpriteResult> {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractText(content: any): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((c) => (typeof c === "string" ? c : JSON.stringify(c))).join("");
+  }
+  return "";
+}
+
+export async function generateSprite(description: string): Promise<SpriteResult> {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     throw new Error("DEEPSEEK_API_KEY environment variable is not set");
@@ -183,33 +197,74 @@ export async function generateSprite(
     },
   });
 
-  const response = await model.invoke([
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: buildUserPrompt(description) },
-  ]);
+  const attempts: Attempt[] = [];
+  let lastError: string | null = null;
+  let sprite: SpriteData | null = null;
 
-  const text =
-    typeof response.content === "string"
-      ? response.content
-      : Array.isArray(response.content)
-        ? response.content.map((c) => (typeof c === "string" ? c : JSON.stringify(c))).join("")
-        : "";
+  for (let i = 0; i < MAX_RETRIES; i++) {
+    const isRetry = i > 0;
+    const userContent = isRetry
+      ? buildRetryPrompt(description, lastError!, attempts[i - 1].rawOutput)
+      : buildUserPrompt(description);
 
-  const { csv, palette } = parseResponse(text);
+    const messages = [
+      new SystemMessage(SYSTEM_PROMPT),
+      new HumanMessage(userContent),
+    ];
 
-  const usage = response.usage_metadata;
-  if (!usage) {
-    throw new Error("No token usage metadata in response");
+    const response = await model.invoke(messages);
+    const rawOutput = extractText(response.content);
+    const usageMeta = response.usage_metadata;
+
+    const attemptMessages = [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userContent },
+    ];
+
+    let attemptError: string | null = null;
+    let attemptUsage: Attempt["usage"] = null;
+
+    if (usageMeta) {
+      attemptUsage = {
+        inputTokens: usageMeta.input_tokens,
+        outputTokens: usageMeta.output_tokens,
+        totalTokens: usageMeta.total_tokens,
+        costUSD: computeCost(usageMeta),
+      };
+    }
+
+    try {
+      const parsed = parseJson(rawOutput);
+      sprite = validateAndExtract(parsed);
+      // Success — record attempt and break
+      attempts.push({
+        messages: attemptMessages,
+        rawOutput: attemptOutputPreview(rawOutput),
+        error: null,
+        usage: attemptUsage,
+      });
+      break;
+    } catch (err) {
+      attemptError = err instanceof Error ? err.message : String(err);
+      lastError = attemptError;
+      attempts.push({
+        messages: attemptMessages,
+        rawOutput: attemptOutputPreview(rawOutput),
+        error: attemptError,
+        usage: attemptUsage,
+      });
+    }
   }
 
   return {
-    csv,
-    palette,
-    usage: {
-      inputTokens: usage.input_tokens,
-      outputTokens: usage.output_tokens,
-      totalTokens: usage.total_tokens,
-      costUSD: computeCost(usage),
-    },
+    sprite,
+    attempts,
+    finalError: sprite ? null : lastError,
   };
+}
+
+/** Truncate raw output for display — keep it readable */
+function attemptOutputPreview(raw: string): string {
+  if (raw.length <= 4000) return raw;
+  return raw.slice(0, 2000) + `\n\n... [${raw.length - 4000} chars trimmed] ...\n\n` + raw.slice(-2000);
 }
