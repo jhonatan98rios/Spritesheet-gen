@@ -21,35 +21,57 @@ export interface SpriteResult {
 }
 
 // DeepSeek V4 Flash pricing per 1M tokens
-const INPUT_PRICE_PER_1M = 0.14;
-const OUTPUT_PRICE_PER_1M = 0.28;
+// DeepSeek V4 Pro pricing per 1M tokens
+const INPUT_PRICE_PER_1M = 0.435;
+const OUTPUT_PRICE_PER_1M = 0.87;
 const MAX_RETRIES = 3;
 
-const SYSTEM_PROMPT = `You are a pixel art generator. You output ONLY valid JSON — no markdown, no explanation, no code fences. Your entire response must parse as JSON.
+const SYSTEM_PROMPT = `You are a pixel art generator for a 64×64 pixel grid. Think step by step, then output the final result as JSON inside \`\`\`json fences.
 
-The JSON object has exactly two keys:
+## GRID RULES
+- The grid is 64 rows (y=0 top to y=63 bottom) × 64 columns (x=0 left to x=63 right).
+- Each cell holds an integer 0-9. 0 = transparent/background.
+- No dithering, no gradients. Solid blocks of color. Retro 8-bit style.
+- Center the subject so it occupies 30-60% of the grid.
 
-1. "csv" — a string containing EXACTLY 64 rows, each row containing EXACTLY 64 comma-separated integers from 0 to 9. Rows are joined by the escape sequence \\n (backslash-n, not a literal newline). No trailing newline. No spaces between commas and numbers.
-   - 0 means transparent/background/empty space. Use it generously for empty areas around the subject.
-   - Values 1-9 represent different colors (defined in the palette).
-   - The sprite must be a recognizable representation of the user's description, centered in the 64x64 grid.
-   - Use solid blocks of color (no dithering, no gradients). Think retro 8-bit pixel art.
-   - The subject should occupy roughly 30-60% of the grid area, centered.
+## STEP 1 — PLAN (think, don't output yet)
+1. What is the subject? What are its key visual features (shapes, proportions)?
+2. Choose exactly 9 colors (indices 1-9) for the subject. Describe what each index represents.
+3. Where will the subject be positioned? Estimate bounding box (min_x, max_x, min_y, max_y).
+4. Index 0 is always transparent background: "rgba(0,0,0,0)".
 
-2. "palette" — an object with keys "0" through "9" mapping to CSS color strings (hex like "#FF8844" or rgba like "rgba(255,136,68,1)").
-   - Key "0" MUST be a fully transparent color: "rgba(0,0,0,0)".
-   - Keys "1" through "9" should be the colors used in the CSV, chosen to match the described subject.
-   - Use distinct, vibrant colors so each index is clearly visible.
-   - Every key "0" through "9" MUST be present exactly once.
+## STEP 2 — DRAW IN 4 CHUNKS OF 16 ROWS
+For each chunk, think about what features appear in those rows, then write the 16 CSV rows.
 
-CRITICAL — the "csv" value is a SINGLE-LINE JSON string. Use \\n escape sequences for row separators. The value must NOT contain literal newline characters. Example: "0,0,0,1,1,0\\\\n0,0,1,1,1,1,0\\\\n..."
+Chunk 1 (rows 0-15): describe features → write 16 rows
+Chunk 2 (rows 16-31): describe features → write 16 rows
+Chunk 3 (rows 32-47): describe features → write 16 rows
+Chunk 4 (rows 48-63): describe features → write 16 rows
 
-CRITICAL CONSTRAINTS:
-- The CSV must have EXACTLY 64 rows. Count them.
-- Each row must have EXACTLY 64 comma-separated values.
-- Use ONLY the digits 0-9 in the CSV.
-- All 10 palette keys ("0" through "9") MUST be present.
-- Output ONLY the JSON object. No markdown, no text.`;
+Each row is 64 comma-separated digits (0-9), no spaces.
+After chunk 4, count your rows. You MUST have exactly 64.
+
+## STEP 3 — FINAL JSON OUTPUT
+Wrap ONLY the JSON in \`\`\`json fences:
+
+\`\`\`json
+{
+  "csv": "<all 64 rows joined by \\n>",
+  "palette": {
+    "0": "rgba(0,0,0,0)",
+    "1": "#color1",
+    ...
+    "9": "#color9"
+  }
+}
+\`\`\`
+
+The "csv" value is a SINGLE-LINE JSON string using \\n for row separators. NO literal newlines inside the string.
+
+## CRITICAL
+- EXACTLY 64 rows, EXACTLY 64 columns each.
+- All 10 palette keys ("0"-"9") must be present.
+- JSON ONLY inside the \`\`\`json fence.`;
 
 function buildUserPrompt(description: string): string {
   return `Generate a 64x64 pixel art sprite of: ${description}`;
@@ -188,7 +210,7 @@ export async function generateSprite(description: string): Promise<SpriteResult>
   }
 
   const model = new ChatOpenAI({
-    model: "deepseek-v4-flash",
+    model: "deepseek-v4-pro",
     temperature: 0.7,
     maxTokens: 16384,
     configuration: {
